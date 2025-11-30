@@ -15,7 +15,7 @@ Route::post('logout', [AuthController::class, 'logout'])->name('logout');
 
 // Protected routes
 Route::middleware('auth')->group(function () {
-	Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
+	Route::get('/', [DashboardController::class, 'index'])->name('dashboard');
 
 	// Resource routes for letters
 	Route::resource('letters', LetterController::class);
