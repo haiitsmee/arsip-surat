@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\IncomingLetter;
 use App\Models\OutgoingLetter;
 use App\Models\Category;
+use App\Models\Log;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Storage;
@@ -19,20 +20,21 @@ class LetterController extends Controller
     {
         $type = $request->type;
         $search = $request->search;
+        $perPage = 10;
+        $page = $request->get('page', 1);
 
-        // If a specific type is requested, query that model and paginate normally
+        // Filter by specific type
         if ($type === 'in') {
             $query = IncomingLetter::with('category', 'user');
-            if ($search) $query = $query->search($search);
-            $items = $query->latest('tanggal_surat')->paginate(10);
+            
+            if ($search) {
+                $query->search($search);
+            }
+            
+            $items = $query->latest('tanggal_surat')->paginate($perPage);
 
             $items->getCollection()->transform(function ($item) {
-                $item->type = 'in';
-                $item->tanggal = $item->tanggal_surat; // view expects `tanggal`
-                $item->creator = $item->user;
-                $item->category_id = $item->kategori_id ?? null;
-                $item->penerima = $item->penerima ?? null;
-                return $item;
+                return $this->transformIncoming($item);
             });
 
             return view('letters.index', ['letters' => $items]);
@@ -40,65 +42,94 @@ class LetterController extends Controller
 
         if ($type === 'out') {
             $query = OutgoingLetter::with('category', 'user');
-            if ($search) $query = $query->search($search);
-            $items = $query->latest('tanggal_surat')->paginate(10);
+            
+            if ($search) {
+                $query->search($search);
+            }
+            
+            $items = $query->latest('tanggal_surat')->paginate($perPage);
 
             $items->getCollection()->transform(function ($item) {
-                $item->type = 'out';
-                $item->tanggal = $item->tanggal_surat;
-                $item->creator = $item->user;
-                $item->category_id = $item->kategori_id ?? null;
-                $item->penerima = $item->tujuan ?? null;
-                return $item;
+                return $this->transformOutgoing($item);
             });
 
             return view('letters.index', ['letters' => $items]);
         }
 
-        // No type filter: fetch both incoming + outgoing, merge & paginate manually
-        $inq = IncomingLetter::with('category', 'user');
-        $out = OutgoingLetter::with('category', 'user');
+        // No type filter: fetch both incoming + outgoing
+        $incomingQuery = IncomingLetter::with('category', 'user');
+        $outgoingQuery = OutgoingLetter::with('category', 'user');
 
         if ($search) {
-            $inq = $inq->search($search);
-            $out = $out->search($search);
+            $incomingQuery->search($search);
+            $outgoingQuery->search($search);
         }
 
-        $incoming = $inq->get()->map(function ($item) {
-            $item->type = 'in';
-            $item->tanggal = $item->tanggal_surat;
-            $item->creator = $item->user;
-            $item->category_id = $item->kategori_id ?? null;
-            $item->penerima = $item->penerima ?? null;
-            return $item;
+        // Get all data and transform
+        $incoming = $incomingQuery->get()->map(function ($item) {
+            return $this->transformIncoming($item);
         });
 
-        $outgoing = $out->get()->map(function ($item) {
-            $item->type = 'out';
-            $item->tanggal = $item->tanggal_surat;
-            $item->creator = $item->user;
-            $item->category_id = $item->kategori_id ?? null;
-            $item->penerima = $item->tujuan ?? null;
-            return $item;
+        $outgoing = $outgoingQuery->get()->map(function ($item) {
+            return $this->transformOutgoing($item);
         });
 
-        $all = $incoming->merge($outgoing)->sortByDesc(function ($i) {
-            return $i->tanggal ?? $i->created_at;
-        })->values();
+        // Reindex both collections to avoid primary-key collisions when merging
+        // (Eloquent collections are keyed by model primary keys so merging
+        // without reindexing can overwrite items when IDs overlap).
+        $all = $incoming->values()->concat($outgoing->values())
+            ->sortByDesc(function($item) {
+                return $item->created_at->timestamp;
+            })
+            ->values();
 
-        $page = $request->get('page', 1);
-        $perPage = 10;
+
+        // Manual pagination
         $offset = ($page - 1) * $perPage;
-
+        $items = $all->slice($offset, $perPage)->values();
+        
         $paged = new LengthAwarePaginator(
-            $all->slice($offset, $perPage)->values(),
+            $items,
             $all->count(),
             $perPage,
             $page,
-            ['path' => url()->current(), 'query' => $request->query()]
+            [
+                'path' => $request->url(),
+                'query' => $request->query()
+            ]
         );
+        
+        $paged->appends($request->query());
 
         return view('letters.index', ['letters' => $paged]);
+    }
+
+    /**
+     * Transform incoming letter for view
+     */
+    private function transformIncoming($item)
+    {
+        $item->type = 'in';
+        $item->tanggal = $item->tanggal_surat;
+        $item->creator = $item->user;
+        $item->category_id = $item->kategori_id;
+        // Incoming letter has 'pengirim', but view also checks 'penerima' for display
+        $item->penerima = null; // incoming doesn't have penerima
+        return $item;
+    }
+
+    /**
+     * Transform outgoing letter for view
+     */
+    private function transformOutgoing($item)
+    {
+        $item->type = 'out';
+        $item->tanggal = $item->tanggal_surat;
+        $item->creator = $item->user;
+        $item->category_id = $item->kategori_id;
+        $item->penerima = $item->tujuan; // outgoing has tujuan -> map to penerima
+        $item->pengirim = null; // outgoing doesn't have pengirim
+        return $item;
     }
 
     /**
@@ -115,12 +146,15 @@ class LetterController extends Controller
      */
     public function store(Request $request)
     {
-        $request->validate([
+        $validated = $request->validate([
             'type'        => 'required|in:in,out',
             'category_id' => 'required|exists:categories,id',
             'perihal'     => 'required',
             'tanggal'     => 'required|date',
-            'file'        => 'nullable|mimes:pdf,jpg,jpeg,png|max:2048',
+            'no_surat'    => 'nullable|string|max:100',
+            'pengirim'    => 'nullable|string|max:255',
+            'penerima'    => 'nullable|string|max:255',
+            'file'        => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:2048',
         ]);
 
         // Upload file jika ada
@@ -129,26 +163,33 @@ class LetterController extends Controller
             $filePath = $request->file('file')->store('letters', 'public');
         }
 
-        if ($request->type === 'in') {
-            IncomingLetter::create([
-                'no_surat'      => $request->no_surat,
-                'pengirim'      => $request->pengirim,
-                'tanggal_surat' => $request->tanggal,
-                'perihal'       => $request->perihal,
-                'kategori_id'   => $request->category_id,
+        if ($validated['type'] === 'in') {
+            $letter = IncomingLetter::create([
+                'no_surat'      => $validated['no_surat'],
+                'pengirim'      => $validated['pengirim'],
+                'tanggal_surat' => $validated['tanggal'],
+                'perihal'       => $validated['perihal'],
+                'kategori_id'   => $validated['category_id'],
                 'file_path'     => $filePath,
                 'user_id'       => Auth::id(),
             ]);
+
+            // Log activity
+            Log::createLog(Auth::id(), 'created', 'incoming', $letter->id);
+
         } else { // out
-            OutgoingLetter::create([
-                'no_surat'      => $request->no_surat,
-                'tujuan'        => $request->penerima,
-                'tanggal_surat' => $request->tanggal,
-                'perihal'       => $request->perihal,
-                'kategori_id'   => $request->category_id,
+            $letter = OutgoingLetter::create([
+                'no_surat'      => $validated['no_surat'],
+                'tujuan'        => $validated['penerima'], // penerima -> tujuan
+                'tanggal_surat' => $validated['tanggal'],
+                'perihal'       => $validated['perihal'],
+                'kategori_id'   => $validated['category_id'],
                 'file_path'     => $filePath,
                 'user_id'       => Auth::id(),
             ]);
+
+            // Log activity
+            Log::createLog(Auth::id(), 'created', 'outgoing', $letter->id);
         }
 
         return redirect()->route('letters.index')
@@ -160,24 +201,23 @@ class LetterController extends Controller
      */
     public function show($id)
     {
+        // Try incoming first
         $model = IncomingLetter::with('category', 'user')->find($id);
-        $type = 'in';
-        if (!$model) {
-            $model = OutgoingLetter::with('category', 'user')->find($id);
-            $type = 'out';
+        
+        if ($model) {
+            $model = $this->transformIncoming($model);
+            return view('letters.show', ['letter' => $model]);
         }
 
-        if (!$model) {
-            return back()->with('error', 'Surat tidak ditemukan.');
+        // Try outgoing
+        $model = OutgoingLetter::with('category', 'user')->find($id);
+        
+        if ($model) {
+            $model = $this->transformOutgoing($model);
+            return view('letters.show', ['letter' => $model]);
         }
 
-        $model->type = $type;
-        $model->tanggal = $model->tanggal_surat;
-        $model->category_id = $model->kategori_id ?? null;
-        $model->setRelation('creator', $model->user);
-        if ($type === 'out') $model->penerima = $model->tujuan ?? null;
-
-        return view('letters.show', ['letter' => $model]);
+        return back()->with('error', 'Surat tidak ditemukan.');
     }
 
     /**
@@ -187,22 +227,23 @@ class LetterController extends Controller
     {
         $categories = Category::all();
 
+        // Try incoming first
         $model = IncomingLetter::with('category', 'user')->find($id);
-        $type = 'in';
-        if (!$model) {
-            $model = OutgoingLetter::with('category', 'user')->find($id);
-            $type = 'out';
+        
+        if ($model) {
+            $model = $this->transformIncoming($model);
+            return view('letters.edit', ['letter' => $model, 'categories' => $categories]);
         }
 
-        if (!$model) return back()->with('error', 'Surat tidak ditemukan.');
+        // Try outgoing
+        $model = OutgoingLetter::with('category', 'user')->find($id);
+        
+        if ($model) {
+            $model = $this->transformOutgoing($model);
+            return view('letters.edit', ['letter' => $model, 'categories' => $categories]);
+        }
 
-        $model->type = $type;
-        $model->tanggal = $model->tanggal_surat;
-        $model->category_id = $model->kategori_id ?? null;
-        $model->setRelation('creator', $model->user);
-        if ($type === 'out') $model->penerima = $model->tujuan ?? null;
-
-        return view('letters.edit', compact('letter', 'categories'))->with('letter', $model);
+        return back()->with('error', 'Surat tidak ditemukan.');
     }
 
     /**
@@ -210,19 +251,33 @@ class LetterController extends Controller
      */
     public function update(Request $request, $id)
     {
-        $request->validate([
+        $validated = $request->validate([
             'type'        => 'required|in:in,out',
             'category_id' => 'required|exists:categories,id',
             'perihal'     => 'required',
             'tanggal'     => 'required|date',
-            'file'        => 'nullable|mimes:pdf,jpg,jpeg,png|max:2048',
+            'no_surat'    => 'nullable|string|max:100',
+            'pengirim'    => 'nullable|string|max:255',
+            'penerima'    => 'nullable|string|max:255',
+            'file'        => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:2048',
         ]);
 
-        $model = IncomingLetter::find($id) ?? OutgoingLetter::find($id);
-        if (!$model) return back()->with('error', 'Surat tidak ditemukan.');
+        // Find the letter
+        $model = IncomingLetter::find($id);
+        $isIncoming = true;
+        
+        if (!$model) {
+            $model = OutgoingLetter::find($id);
+            $isIncoming = false;
+        }
+
+        if (!$model) {
+            return back()->with('error', 'Surat tidak ditemukan.');
+        }
 
         $filePath = $model->file_path;
 
+        // Handle file upload
         if ($request->hasFile('file')) {
             if ($filePath && Storage::disk('public')->exists($filePath)) {
                 Storage::disk('public')->delete($filePath);
@@ -230,25 +285,30 @@ class LetterController extends Controller
             $filePath = $request->file('file')->store('letters', 'public');
         }
 
-        if ($request->type === 'in' && $model instanceof IncomingLetter) {
+        // Update based on type
+        if ($validated['type'] === 'in' && $isIncoming) {
             $model->update([
-                'kategori_id'   => $request->category_id,
-                'no_surat'      => $request->no_surat,
-                'pengirim'      => $request->pengirim,
-                'tanggal_surat' => $request->tanggal,
-                'perihal'       => $request->perihal,
+                'kategori_id'   => $validated['category_id'],
+                'no_surat'      => $validated['no_surat'],
+                'pengirim'      => $validated['pengirim'],
+                'tanggal_surat' => $validated['tanggal'],
+                'perihal'       => $validated['perihal'],
                 'file_path'     => $filePath,
             ]);
 
-        } elseif ($request->type === 'out' && $model instanceof OutgoingLetter) {
+            Log::createLog(Auth::id(), 'updated', 'incoming', $model->id);
+
+        } elseif ($validated['type'] === 'out' && !$isIncoming) {
             $model->update([
-                'kategori_id'   => $request->category_id,
-                'no_surat'      => $request->no_surat,
-                'tujuan'        => $request->penerima,
-                'tanggal_surat' => $request->tanggal,
-                'perihal'       => $request->perihal,
+                'kategori_id'   => $validated['category_id'],
+                'no_surat'      => $validated['no_surat'],
+                'tujuan'        => $validated['penerima'],
+                'tanggal_surat' => $validated['tanggal'],
+                'perihal'       => $validated['perihal'],
                 'file_path'     => $filePath,
             ]);
+
+            Log::createLog(Auth::id(), 'updated', 'outgoing', $model->id);
 
         } else {
             return back()->with('error', 'Tipe surat tidak sesuai dengan data yang ada.');
@@ -263,12 +323,30 @@ class LetterController extends Controller
      */
     public function destroy($id)
     {
-        $model = IncomingLetter::find($id) ?? OutgoingLetter::find($id);
-        if (!$model) return back()->with('error', 'Surat tidak ditemukan.');
+        $model = IncomingLetter::find($id);
+        $isIncoming = true;
+        
+        if (!$model) {
+            $model = OutgoingLetter::find($id);
+            $isIncoming = false;
+        }
 
+        if (!$model) {
+            return back()->with('error', 'Surat tidak ditemukan.');
+        }
+
+        // Delete file if exists
         if ($model->file_path && Storage::disk('public')->exists($model->file_path)) {
             Storage::disk('public')->delete($model->file_path);
         }
+
+        // Log before delete
+        Log::createLog(
+            Auth::id(), 
+            'deleted', 
+            $isIncoming ? 'incoming' : 'outgoing', 
+            $model->id
+        );
 
         $model->delete();
 
@@ -281,11 +359,29 @@ class LetterController extends Controller
      */
     public function download($id)
     {
-        $model = IncomingLetter::find($id) ?? OutgoingLetter::find($id);
+        $model = IncomingLetter::find($id);
+        $isIncoming = true;
+        
+        if (!$model) {
+            $model = OutgoingLetter::find($id);
+            $isIncoming = false;
+        }
+
         if (!$model || !$model->file_path || !Storage::disk('public')->exists($model->file_path)) {
             return back()->with('error', 'File tidak ditemukan.');
         }
 
-        return response()->download(Storage::disk('public')->path($model->file_path), basename($model->file_path));
+        // Log download
+        Log::createLog(
+            Auth::id(), 
+            'downloaded', 
+            $isIncoming ? 'incoming' : 'outgoing', 
+            $model->id
+        );
+
+        return response()->download(
+            Storage::disk('public')->path($model->file_path),
+            basename($model->file_path)
+        );
     }
 }

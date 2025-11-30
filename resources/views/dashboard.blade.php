@@ -29,7 +29,7 @@
     </div>
 
     <div>
-        <h3 class="text-lg font-semibold text-gray-800 mb-4">Recent Surat</h3>
+        <h3 class="text-lg font-semibold text-gray-800 mb-4">Surat Terbaru</h3>
         @if($recent->isEmpty())
             <p class="text-sm text-gray-500">Belum ada surat.</p>
         @else
